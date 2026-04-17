@@ -33,11 +33,13 @@ Output per visit: data/stamps/stamps_{visit}.npz  containing:
 
 Usage
 -----
-  python extract_star_stamps.py                          # all visits, 1/raft
+  python extract_star_stamps.py                          # all DP2 visits, 1/raft
   python extract_star_stamps.py --n-per-raft 10         # stack 10/raft
   python extract_star_stamps.py --visit 2024021200001   # single visit
   python extract_star_stamps.py --visit-list visits.txt
   python extract_star_stamps.py --ncpu 4                # fewer workers
+  python extract_star_stamps.py --post-dp2              # all post-DP2 visits (nightlyValidation)
+  python extract_star_stamps.py --post-dp2 --visit 2026040900406
 """
 
 # Must be set before polars is imported anywhere (including in workers).
@@ -59,6 +61,19 @@ from lsst.obs.lsst import LsstCam
 
 REPO        = "dp2_prep"
 COLLECTION  = "LSSTCam/runs/DRP/DP2/v30_0_0/DM-53881/stage2"
+CATALOG     = "refit_psf_star"
+
+POST_DP2_CATALOG    = "single_visit_star"
+
+# Repo + collections that jointly cover Jan–Apr 2026 for single_visit_star + PVI.
+# Each entry is (repo, collection, day_obs_start, day_obs_end_inclusive).
+POST_DP2_SOURCES = [
+    ("main",        "LSSTCam/runs/nightlyValidation/34", 20251216, 20260115),
+    ("main",        "LSSTCam/runs/nightlyValidation/36", 20260116, 20260119),
+    ("main",        "LSSTCam/runs/nightlyValidation/37", 20260127, 20260403),
+    ("embargo_new", "LSSTCam/runs/nightlyValidation/37", 20260404, 20260415),
+]
+
 STAMP_SIZE  = 32
 NCPU        = 8
 N_PER_RAFT  = 1    # stars to sample and stack per raft
@@ -72,36 +87,42 @@ SCIENCE_RAFTS = [
 ]
 
 # ── Worker-process globals (set once by _worker_init) ────────────────────────
-_W_BUTLER      = None
+_W_BUTLERS     = None   # dict  (repo, collection) -> Butler instance
 _W_DET2RAFT    = None
 _W_SCI_RAFTS   = None
 _W_STAMP_SIZE  = None
 _W_OUT_DIR     = None
 _W_N_PER_RAFT  = None
+_W_CATALOG     = None
 
 
-def _worker_init(repo_, collection_, det2raft_, sci_rafts_, stamp_size_, out_dir_, n_per_raft_):
+def _worker_init(repo_col_pairs_, det2raft_, sci_rafts_, stamp_size_, out_dir_, n_per_raft_, catalog_):
     """Runs once per worker process after spawn. Imports are fresh here."""
-    global _W_BUTLER, _W_DET2RAFT, _W_SCI_RAFTS, _W_STAMP_SIZE, _W_OUT_DIR, _W_N_PER_RAFT
+    global _W_BUTLERS, _W_DET2RAFT, _W_SCI_RAFTS, _W_STAMP_SIZE, _W_OUT_DIR, _W_N_PER_RAFT, _W_CATALOG
     import warnings
     warnings.filterwarnings("ignore", category=FutureWarning)
     from lsst.daf.butler import Butler as _B
-    _W_BUTLER      = _B(repo_, collections=collection_)
+    _W_BUTLERS     = {}
+    for repo, col in repo_col_pairs_:
+        _W_BUTLERS[(repo, col)] = _B(repo, collections=col)
     _W_DET2RAFT    = det2raft_
     _W_SCI_RAFTS   = sci_rafts_
     _W_STAMP_SIZE  = stamp_size_
     _W_OUT_DIR     = out_dir_
     _W_N_PER_RAFT  = n_per_raft_
+    _W_CATALOG     = catalog_
 
 
 # ── Top-level worker (must be importable at module level for spawn) ──────────
-def _worker(visit_band):
+def _worker(task):
     """Process one visit: one full PVI load per raft, numpy-slice stamps."""
     import gc as _gc
     import numpy as _np
     import polars as _pl
 
-    visit, band = visit_band
+    visit, band, repo, collection = task
+    butler = _W_BUTLERS[(repo, collection)]
+
     out_path = os.path.join(_W_OUT_DIR, f"stamps_{visit}.npz")
     if os.path.exists(out_path):
         return visit, -1, None   # -1 = already done
@@ -109,25 +130,42 @@ def _worker(visit_band):
     t_visit = time.perf_counter()
     timings = {}
 
-    # 1. Load centroid parquet
+    # 1. Load star catalog
     t0 = time.perf_counter()
     try:
-        uri = _W_BUTLER.getURI("refit_psf_star", instrument="LSSTCam", visit=visit)
-        psf_table = (
-            _pl.scan_parquet(uri.geturl())
-            .select(["slot_Centroid_x", "slot_Centroid_y", "detector"])
-            .collect()
-        )
+        if _W_CATALOG == "refit_psf_star":
+            uri = butler.getURI("refit_psf_star", instrument="LSSTCam", visit=visit)
+            psf_table = (
+                _pl.scan_parquet(uri.geturl())
+                .select(["slot_Centroid_x", "slot_Centroid_y", "detector"])
+                .collect()
+            )
+            cx_col, cy_col = "slot_Centroid_x", "slot_Centroid_y"
+        else:
+            # single_visit_star: may be on S3, use butler.get() (returns astropy Table)
+            atbl = butler.get(_W_CATALOG, instrument="LSSTCam", visit=visit)
+            # Filter to PSF stars only
+            mask = atbl["calib_psf_used"]
+            psf_table = _pl.DataFrame({
+                "x": _np.asarray(atbl["x"][mask], dtype=_np.float64),
+                "y": _np.asarray(atbl["y"][mask], dtype=_np.float64),
+                "detector": _np.asarray(atbl["detector"][mask], dtype=_np.int32),
+            })
+            del atbl, mask
+            cx_col, cy_col = "x", "y"
     except Exception as exc:
-        return visit, 0, f"parquet load failed: {exc}"
+        return visit, 0, f"catalog load failed: {exc}"
     timings["parquet"] = time.perf_counter() - t0
+
+    if len(psf_table) == 0:
+        return visit, 0, "no PSF stars in catalog"
 
     # 2. Assign raft labels and filter finite centroids
     t0 = time.perf_counter()
     det_ids = psf_table["detector"].to_numpy()
-    rafts   = _np.array([_W_DET2RAFT.get(int(d), "unknown") for d in det_ids])
+    rafts   = _np.array([_W_DET2RAFT.get(int(d), "unknown") for d in det_ids], dtype=str)
     psf_table = psf_table.with_columns(_pl.Series("raft", rafts)).filter(
-        _pl.col("slot_Centroid_x").is_finite() & _pl.col("slot_Centroid_y").is_finite()
+        _pl.col(cx_col).is_finite() & _pl.col(cy_col).is_finite()
     )
     del det_ids, rafts
     timings["sampling"] = time.perf_counter() - t0
@@ -156,7 +194,7 @@ def _worker(visit_band):
         # Load full PVI for that detector (one Butler call per raft)
         t0 = time.perf_counter()
         try:
-            exp  = _W_BUTLER.get(
+            exp  = butler.get(
                 "preliminary_visit_image",
                 instrument="LSSTCam", visit=visit, detector=chosen_det,
             )
@@ -187,8 +225,8 @@ def _worker(visit_band):
         raft_cx     = []
         raft_cy     = []
         for row in selected.iter_rows(named=True):
-            cx = float(row["slot_Centroid_x"])
-            cy = float(row["slot_Centroid_y"])
+            cx = float(row[cx_col])
+            cy = float(row[cy_col])
             ix = int(round(cx))
             iy = int(round(cy))
 
@@ -250,9 +288,34 @@ def _worker(visit_band):
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def build_visit_band_map(butler):
-    dsrs = list(butler.registry.queryDatasets("refit_psf_star"))
+
+def build_visit_band_map(butler, catalog):
+    dsrs = list(butler.registry.queryDatasets(catalog))
     return {dsr.dataId["visit"]: dsr.dataId["band"] for dsr in dsrs}
+
+
+def build_post_dp2_tasks(sources, catalog):
+    """Build (visit, band, repo, collection) list from multiple repo/collection sources.
+
+    Also returns the set of unique (repo, collection) pairs needed by workers.
+    """
+    tasks = []           # (visit, band, repo, collection)
+    seen_visits = set()  # deduplicate across overlapping collections
+    repo_col_pairs = set()
+
+    for repo, collection, _day_start, _day_end in sources:
+        butler = Butler(repo, collections=collection)
+        vbmap = build_visit_band_map(butler, catalog)
+        del butler
+        gc.collect()
+
+        repo_col_pairs.add((repo, collection))
+        for v in sorted(vbmap):
+            if v not in seen_visits:
+                seen_visits.add(v)
+                tasks.append((v, vbmap[v], repo, collection))
+
+    return tasks, sorted(repo_col_pairs)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -262,8 +325,18 @@ def main():
     grp = parser.add_mutually_exclusive_group()
     grp.add_argument("--visit",      type=int, help="Single visit ID")
     grp.add_argument("--visit-list", type=str, help="File with one visit ID per line")
-    parser.add_argument("--repo",        default=REPO)
-    parser.add_argument("--collection",  default=COLLECTION)
+    parser.add_argument("--repo",        default=REPO,
+                        help=f"Butler repo (default: {REPO}; ignored with --post-dp2)")
+    parser.add_argument("--collection",  default=COLLECTION,
+                        help=f"Butler collection (default: DP2 collection; ignored with --post-dp2)")
+    parser.add_argument("--catalog",     default=None,
+                        help=f"Star catalog dataset type (default: {CATALOG}, or {POST_DP2_CATALOG} with --post-dp2)")
+    parser.add_argument("--post-dp2",    action="store_true",
+                        help="Use post-DP2 defaults: multi-repo nightlyValidation, single_visit_star catalog, science-only filter")
+    parser.add_argument("--science-visits", type=str, default=None,
+                        help="File of science visit IDs (one per line) from fetch_science_visits.py. "
+                             "Filters to these visits instead of querying consDB. "
+                             "Auto-enabled with --post-dp2 if data/science_visits.txt exists.")
     parser.add_argument("--stamp-size",  type=int, default=STAMP_SIZE)
     parser.add_argument("--n-per-raft",  type=int, default=N_PER_RAFT,
                         help="Stars to sample and stack per raft (default: %(default)s)")
@@ -271,26 +344,60 @@ def main():
     parser.add_argument("--ncpu",        type=int, default=NCPU)
     args = parser.parse_args()
 
+    # Resolve catalog default
+    if args.catalog is None:
+        args.catalog = POST_DP2_CATALOG if args.post_dp2 else CATALOG
+    if args.post_dp2 and args.science_visits is None:
+        # Auto-detect the pre-fetched file
+        default_sv = os.path.join(os.path.dirname(__file__) or ".", "data", "science_visits.txt")
+        if os.path.exists(default_sv):
+            args.science_visits = default_sv
+            print(f"Auto-detected --science-visits {default_sv}")
+
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Build visit→band map, then DELETE the butler before spawning workers.
-    print("Querying all refit_psf_star datasets…")
-    t0 = time.perf_counter()
-    butler = Butler(args.repo, collections=args.collection)
-    visit_band_map = build_visit_band_map(butler)
-    del butler
-    gc.collect()
-    print(f"Found {len(visit_band_map)} visits  ({time.perf_counter()-t0:.1f}s)")
+    # ── Build task list: (visit, band, repo, collection) ──
+    if args.post_dp2:
+        print(f"Querying {args.catalog} across {len(POST_DP2_SOURCES)} nightlyValidation sources…")
+        t0 = time.perf_counter()
+        tasks, repo_col_pairs = build_post_dp2_tasks(POST_DP2_SOURCES, args.catalog)
+        print(f"Found {len(tasks)} visits  ({time.perf_counter()-t0:.1f}s)")
 
-    if args.visit:
-        visits = [args.visit]
-    elif args.visit_list:
-        with open(args.visit_list) as f:
-            visits = [int(l.strip()) for l in f if l.strip()]
+        # Filter to user-requested subset
+        if args.visit:
+            tasks = [t for t in tasks if t[0] == args.visit]
+        elif args.visit_list:
+            with open(args.visit_list) as f:
+                wanted = {int(l.strip()) for l in f if l.strip()}
+            tasks = [t for t in tasks if t[0] in wanted]
     else:
-        visits = sorted(visit_band_map.keys())
+        print(f"Querying all {args.catalog} datasets…")
+        t0 = time.perf_counter()
+        butler = Butler(args.repo, collections=args.collection)
+        visit_band_map = build_visit_band_map(butler, args.catalog)
+        del butler
+        gc.collect()
+        print(f"Found {len(visit_band_map)} visits  ({time.perf_counter()-t0:.1f}s)")
 
-    tasks = [(v, visit_band_map.get(v, "unknown")) for v in visits]
+        if args.visit:
+            visits = [args.visit]
+        elif args.visit_list:
+            with open(args.visit_list) as f:
+                visits = [int(l.strip()) for l in f if l.strip()]
+        else:
+            visits = sorted(visit_band_map.keys())
+
+        tasks = [(v, visit_band_map.get(v, "unknown"), args.repo, args.collection)
+                 for v in visits]
+        repo_col_pairs = [(args.repo, args.collection)]
+
+    # Filter to science visits from pre-fetched file (no network needed)
+    if args.science_visits and tasks:
+        with open(args.science_visits) as f:
+            science_set = {int(l.strip()) for l in f if l.strip()}
+        n_before = len(tasks)
+        tasks = [t for t in tasks if t[0] in science_set]
+        print(f"Science-visit filter ({args.science_visits}): {n_before} → {len(tasks)} visits")
 
     # Build det→raft in main (avoids re-importing LsstCam in every worker).
     _camera  = LsstCam.getCamera()
@@ -301,7 +408,7 @@ def main():
 
     print(
         f"Processing {len(tasks)} visit(s) with {args.ncpu} workers (spawn), "
-        f"n_per_raft={args.n_per_raft}…"
+        f"n_per_raft={args.n_per_raft}, catalog={args.catalog}…"
     )
 
     ctx = multiprocessing.get_context("spawn")
@@ -309,8 +416,9 @@ def main():
         processes=args.ncpu,
         context=ctx,
         initializer=_worker_init,
-        initargs=(args.repo, args.collection, det2raft,
-                  list(SCIENCE_RAFTS), args.stamp_size, args.out_dir, args.n_per_raft),
+        initargs=(repo_col_pairs, det2raft,
+                  list(SCIENCE_RAFTS), args.stamp_size, args.out_dir, args.n_per_raft,
+                  args.catalog),
         maxtasksperchild=100,
     ) as pool:
         pbar = tqdm(total=len(tasks), desc="visits")
